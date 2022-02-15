@@ -4,7 +4,10 @@ This repository contains code accompanying the paper [IGLU: EffIcient Training o
 
 
 
-To cite our work, do use the following BibTex
+In case of any questions, feel free to raise an issue. 
+
+To cite our work, kindly use the BibTeX below. 
+
 ```
 @inproceedings{
 narayanan2022iglu,

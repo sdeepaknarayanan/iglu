@@ -1,6 +1,6 @@
-# IGLU: EffIcient Training of GCNs using Lazy Updates
+# IGLU: EffIcient GCN Training via Lazy Updates
 
-This repository contains code accompanying the paper [IGLU: EffIcient Training of GCNs using Lazy Updates](https://openreview.net/forum?id=5kq11Tl1z4). 
+This repository contains code accompanying the paper [IGLU: EffIcient GCN Training via Lazy Updates](https://openreview.net/forum?id=5kq11Tl1z4). 
 
 
 

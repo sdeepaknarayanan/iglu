@@ -1,15 +1,12 @@
 import warnings
 warnings.filterwarnings('ignore')
 import tensorflow as tf
-import numpy as np
 import argparse
 import numpy as np
-import matplotlib.pyplot as plt
 import os
 import scipy.sparse as sp
 from copy import deepcopy
 from sklearn.metrics import f1_score
-import matplotlib.pyplot as plt
 import time
 import sys
 from utils import *
@@ -17,58 +14,6 @@ import multiprocessing
 from sklearn import metrics
 from sklearn.metrics import roc_auc_score
 
-parser = argparse.ArgumentParser(description='Parameters for running IGLU')
-parser.add_argument('--batchsize', metavar='INT', default = 512, dest='batch_size', type=int,
-help = 'Number of Nodes per minibatch.')
-parser.add_argument('--learning_rate', metavar='FLOAT', default = 1e-2, type = float, dest='lr', help = 'Learning Rate')
-parser.add_argument('--gpuid', metavar='0|1|2|3',default = 1,  type = int, dest='gpuid', help = 'GPU ID')
-parser.add_argument('--data_path', metavar='STRING',  type = str, dest='data_path', help = 'Path to the dataset')
-
-args = parser.parse_args()
-def set_gpu(gpus):
-    import os
-    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpus
-
-    # Check if tensorflow is running on a gpu
-    if tf.test.gpu_device_name():
-        print('GPU found')
-    else:
-        print("No GPU found")
-        
-set_gpu(str(args.gpuid))
-
-#Load Data
-start_data_time = time.time()
-labels = np.load(args.data_path+"/Labels.npy")
-train_ix = np.load(args.data_path+"/SortedTrainIndex.npy")
-valid_ix = np.load(args.data_path+"/SortedValidIndex.npy")
-test_ix = np.load(args.data_path+"/SortedTestIndex.npy")
-feat_data = np.load(args.data_path+"/feat.npy")
-train_adj = sp.load_npz(args.data_path+"/adj_train.npz")
-full_adj = sp.load_npz(args.data_path+"/adj_full.npz")
-print("Time to load data:", time.time()-start_data_time)
-indices = {}
-indices['train'] = train_ix
-indices['valid'] = valid_ix
-indices['test'] = test_ix
-
-from utils import *
-adj_normalize = 'GCN'
-
-if adj_normalize == "GCN":
-    v = np.zeros(train_adj.shape[0])
-    v[train_ix] = 1
-    t=sp.diags(v)
-    train_laplacian = normalize(train_adj + t)
-    full_laplacian = normalize(full_adj + sp.eye(full_adj.shape[0]))
-elif adj_normalize =="SAINT":
-    v = np.zeros(train_adj.shape[0])
-    v[train_ix] = 1
-    t=sp.diags(v)
-    train_laplacian = saint_normalize(train_adj + t)
-    full_laplacian = saint_normalize(full_adj + sp.eye(full_adj.shape[0]))
-    
     
 def get_sparse_adj(A):
     from scipy.sparse import csr_matrix
@@ -78,15 +23,6 @@ def convert_sparse_matrix_to_sparse_tensor(X):
     coo = X.tocoo()
     indices = np.mat([coo.row, coo.col]).transpose()
     return (indices, coo.data, coo.shape)
-
-def get_tensor_values(adj, num_adj):
-    adj = adj.astype(np.float32)
-    num_nodes = adj.shape[0]
-    ix = [(i*num_nodes//num_adj, (i+1) * num_nodes//num_adj) for i in range(num_adj)]
-    adjs = [adj[ix[i][0]:ix[i][1], :] for i in range(num_adj)]
-    sparse_vals = {ix: tf.SparseTensorValue(*convert_sparse_matrix_to_sparse_tensor(adjs[ix])) \
-                  for ix in range(num_adj)}
-    return sparse_vals
 
 def MyLayerNorm(x, ctr_val):
     mean, variance = tf.nn.moments(x, axes=[0], keep_dims=True)
@@ -116,21 +52,16 @@ def ones(shape, name=None):
     return tf.get_variable(name=name, shape=shape, dtype=tf.float32, 
                            initializer=tf.ones_initializer())
 
+def set_gpu(gpus):
+    import os
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpus
 
-train_laplacian = train_laplacian[:train_ix.shape[0]][:, :train_ix.shape[0]]
-
-adj= train_laplacian
-num_adj = 32
-adj = adj.astype(np.float32)
-
-num_nodes = adj.shape[0]
-num_nodes = 86619
-ix = [(i*num_nodes//num_adj, (i+1) * num_nodes//num_adj) for i in range(num_adj)]
-adjs = [adj[ix[i][0]:ix[i][1], :] for i in range(num_adj)]
-sparse_vals = {ix: tf.SparseTensorValue(*convert_sparse_matrix_to_sparse_tensor(adjs[ix])) \
-              for ix in range(num_adj)}
-
-vals = sparse_vals
+    # Check if tensorflow is running on a gpu
+    if tf.test.gpu_device_name():
+        print('GPU found')
+    else:
+        print("No GPU found")
 
 def get_tensor_values(adj, num_adj):
     adj = adj.astype(np.float32)
@@ -156,6 +87,107 @@ def masked_sigmoid_cross_entropy(preds, labels, mask):
     mask /= tf.reduce_mean(mask)
     loss *= tf.reshape(mask, [-1, 1])
     return tf.reduce_mean(loss)
+
+def mini_batch_exact(batch_nodes, adj_matrix, depth = 1):
+    sampled_nodes = []
+    previous_nodes = batch_nodes
+    adjs = []
+    for d in range(depth):
+        U = adj_matrix[previous_nodes, :]
+        after_nodes = []
+        for U_row in U:
+            indices = U_row.indices
+            after_nodes.append(indices)
+        after_nodes = np.unique(np.concatenate(after_nodes))
+        after_nodes = np.concatenate(
+            [previous_nodes, np.setdiff1d(after_nodes, previous_nodes)])
+        adj = U[:, after_nodes]
+        adjs += [adj]
+        sampled_nodes.append(previous_nodes)
+        previous_nodes = after_nodes
+    adjs.reverse()
+    sampled_nodes.reverse()
+    return adjs, previous_nodes, sampled_nodes
+
+def get_sampled_adjs_1(batch, laplacian_matrix, samp_num_list, depth = 1):
+    adjs, prev_nodes, sampled_nodes = mini_batch_exact(batch,
+                                                 adj_matrix = laplacian_matrix,
+                                                 depth = depth)
+    adjs = [sparse_to_tuple(v) for v in adjs]
+    return ((adjs, prev_nodes, sampled_nodes), batch)
+
+def calc_f1( y_true, y_pred,is_sigmoid):
+    if not is_sigmoid:
+        y_true = np.argmax(y_true, axis=1)
+        y_pred = np.argmax(y_pred, axis=1)
+        return metrics.f1_score(y_true, y_pred, average="micro")
+    else:
+        y_pred_met = deepcopy(y_pred)
+        y_pred_met[y_pred_met > 0] = 1
+        y_pred_met[y_pred_met <= 0] = 0
+        return metrics.f1_score(y_true, y_pred_met, average="micro"), metrics.f1_score(y_true, y_pred_met, average="macro")
+
+
+
+parser = argparse.ArgumentParser(description='Parameters for running IGLU')
+parser.add_argument('--batchsize', metavar='INT', default = 512, dest='batch_size', type=int,
+help = 'Number of Nodes per minibatch.')
+parser.add_argument('--learning_rate', metavar='FLOAT', default = 1e-2, type = float, dest='lr', help = 'Learning Rate')
+parser.add_argument('--gpuid', metavar='0|1|2|3',default = 1,  type = int, dest='gpuid', help = 'GPU ID')
+parser.add_argument('--data_path', metavar='STRING',  type = str, dest='data_path', help = 'Path to the dataset')
+
+args = parser.parse_args()
+        
+set_gpu(str(args.gpuid))
+
+#Load Data
+start_data_time = time.time()
+labels = np.load(args.data_path+"/Labels.npy")
+train_ix = np.load(args.data_path+"/SortedTrainIndex.npy")
+valid_ix = np.load(args.data_path+"/SortedValidIndex.npy")
+test_ix = np.load(args.data_path+"/SortedTestIndex.npy")
+feat_data = np.load(args.data_path+"/feat.npy")
+train_adj = sp.load_npz(args.data_path+"/adj_train.npz")
+full_adj = sp.load_npz(args.data_path+"/adj_full.npz")
+print("Time to load data:", time.time()-start_data_time)
+
+indices = {}
+indices['train'] = train_ix
+indices['valid'] = valid_ix
+indices['test'] = test_ix
+
+
+adj_normalize = 'GCN'
+
+if adj_normalize == "GCN":
+    v = np.zeros(train_adj.shape[0])
+    v[train_ix] = 1
+    t=sp.diags(v)
+    train_laplacian = normalize(train_adj + t)
+    full_laplacian = normalize(full_adj + sp.eye(full_adj.shape[0]))
+
+elif adj_normalize =="SAINT":
+    v = np.zeros(train_adj.shape[0])
+    v[train_ix] = 1
+    t=sp.diags(v)
+    train_laplacian = saint_normalize(train_adj + t)
+    full_laplacian = saint_normalize(full_adj + sp.eye(full_adj.shape[0]))
+    
+
+train_laplacian = train_laplacian[:train_ix.shape[0]][:, :train_ix.shape[0]]
+
+adj= train_laplacian
+num_adj = 32
+adj = adj.astype(np.float32)
+
+num_nodes = adj.shape[0]
+num_nodes = 86619
+ix = [(i*num_nodes//num_adj, (i+1) * num_nodes//num_adj) for i in range(num_adj)]
+adjs = [adj[ix[i][0]:ix[i][1], :] for i in range(num_adj)]
+sparse_vals = {ix: tf.SparseTensorValue(*convert_sparse_matrix_to_sparse_tensor(adjs[ix])) \
+              for ix in range(num_adj)}
+
+vals = sparse_vals
 
 train_feat = np.zeros((train_laplacian.shape[0], feat_data.shape[1]))
 train_feat[train_ix] = feat_data[train_ix]
@@ -324,34 +356,6 @@ optimizer = {
 
 batch_size = args.batch_size
 
-def mini_batch_exact(batch_nodes, adj_matrix, depth = 1):
-    sampled_nodes = []
-    previous_nodes = batch_nodes
-    adjs = []
-    for d in range(depth):
-        U = adj_matrix[previous_nodes, :]
-        after_nodes = []
-        for U_row in U:
-            indices = U_row.indices
-            after_nodes.append(indices)
-        after_nodes = np.unique(np.concatenate(after_nodes))
-        after_nodes = np.concatenate(
-            [previous_nodes, np.setdiff1d(after_nodes, previous_nodes)])
-        adj = U[:, after_nodes]
-        adjs += [adj]
-        sampled_nodes.append(previous_nodes)
-        previous_nodes = after_nodes
-    adjs.reverse()
-    sampled_nodes.reverse()
-    return adjs, previous_nodes, sampled_nodes
-
-def get_sampled_adjs_1(batch, laplacian_matrix, samp_num_list, depth = 1):
-    adjs, prev_nodes, sampled_nodes = mini_batch_exact(batch,
-                                                 adj_matrix = laplacian_matrix,
-                                                 depth = depth)
-    adjs = [sparse_to_tuple(v) for v in adjs]
-    return ((adjs, prev_nodes, sampled_nodes), batch)
-
 train_batches = []
 train_index = np.random.permutation(np.arange(len(train_ix)))
 
@@ -362,25 +366,12 @@ for _ in range(0, len(train_ix), batch_size):
 
 arg_list = [(batch, train_laplacian, [10]) for _, batch in enumerate(train_batches)]
 
-import multiprocessing
 with multiprocessing.Pool(processes=3) as pool:
     results = pool.starmap(get_sampled_adjs_1,arg_list)
 train_data_batch = {
     ix: ((results[ix][0][0], results[ix][0][1], results[ix][0][2]), results[ix][1])
 for ix, batch in enumerate(train_batches)
 }
-
-from sklearn import metrics
-def calc_f1( y_true, y_pred,is_sigmoid):
-    if not is_sigmoid:
-        y_true = np.argmax(y_true, axis=1)
-        y_pred = np.argmax(y_pred, axis=1)
-        return metrics.f1_score(y_true, y_pred, average="micro")
-    else:
-        y_pred_met = deepcopy(y_pred)
-        y_pred_met[y_pred_met > 0] = 1
-        y_pred_met[y_pred_met <= 0] = 0
-        return metrics.f1_score(y_true, y_pred_met, average="micro"), metrics.f1_score(y_true, y_pred_met, average="macro")
 
 vals_f = get_tensor_values(full_laplacian, num_adj = 20)
 

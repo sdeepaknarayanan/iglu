@@ -3,8 +3,6 @@ warnings.filterwarnings('ignore')
 import tensorflow as tf
 import numpy as np
 import argparse
-import numpy as np
-import matplotlib.pyplot as plt
 import os
 import scipy.sparse as sp
 from copy import deepcopy
@@ -15,8 +13,114 @@ import sys
 from utils import *
 import multiprocessing
 from sklearn import metrics
-from copy import deepcopy
 
+def set_gpu(gpus):
+    import os
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpus
+
+    # Check if tensorflow is running on a gpu
+    if tf.test.gpu_device_name():
+        print('GPU found')
+    else:
+        print("No GPU found")
+
+
+def get_sparse_adj(A):
+    from scipy.sparse import csr_matrix
+    return csr_matrix((A[1], (A[0][:, 0], A[0][:, 1])), A[2])
+
+def convert_sparse_matrix_to_sparse_tensor(X):
+    coo = X.tocoo()
+    indices = np.mat([coo.row, coo.col]).transpose()
+    return (indices, coo.data, coo.shape)
+
+def get_tensor_values(adj, num_adj):
+    adj = adj.astype(np.float32)
+    num_nodes = train_laplacian.shape[0]
+    ix = [(i*num_nodes//num_adj, (i+1) * num_nodes//num_adj) for i in range(num_adj)]
+    adjs = [adj[ix[i][0]:ix[i][1], :] for i in range(num_adj)]
+    sparse_vals = {ix: tf.SparseTensorValue(*convert_sparse_matrix_to_sparse_tensor(adjs[ix])) \
+                  for ix in range(num_adj)}
+    return sparse_vals
+
+
+def MyLayerNorm(x):
+    mean, variance = tf.nn.moments(x, axes=[1], keep_dims=True)
+    
+    offset = zeros([1, x.get_shape()[1]], name='offset')
+    scale  = ones([1, x.get_shape()[1]], name='scale')
+    return tf.nn.batch_normalization(x, mean, variance, offset, scale, 1e-9), offset, scale
+
+def MyLayerNorm1(x):
+    mean, variance = tf.nn.moments(x, axes=[1], keep_dims=True)
+    
+    offset = tf.get_variable(name='testoffset', shape=[1, x.get_shape()[1]], dtype=tf.float32, 
+                           initializer=tf.zeros_initializer(), trainable=False)
+    scale  = tf.get_variable(name='testscale', shape=[1, x.get_shape()[1]], dtype=tf.float32, 
+                           initializer=tf.ones_initializer(), trainable=False)
+    return tf.nn.batch_normalization(x, mean, variance, offset, scale, 1e-9), offset, scale
+
+
+def zeros(shape, name=None):
+    """All zeros."""
+    return tf.get_variable(name=name, shape=shape, dtype=tf.float32, 
+                           initializer=tf.zeros_initializer())
+
+
+def ones(shape, name=None):
+    """All ones."""
+    return tf.get_variable(name=name, shape=shape, dtype=tf.float32, 
+                           initializer=tf.ones_initializer())
+
+def masked_softmax_cross_entropy(preds, labels, mask):
+    """Softmax cross-entropy loss with masking."""
+    loss = tf.nn.softmax_cross_entropy_with_logits(logits=preds, labels=labels)
+    mask = tf.cast(mask, dtype=tf.float32)
+    mask /= tf.reduce_mean(mask)
+    loss *= mask
+    return tf.reduce_mean(loss)
+
+def mini_batch_exact(batch_nodes, adj_matrix, depth = 1):
+    sampled_nodes = []
+    previous_nodes = batch_nodes
+    adjs = []
+    for d in range(depth):
+        U = adj_matrix[previous_nodes, :]
+        after_nodes = []
+        for U_row in U:
+            indices = U_row.indices
+            after_nodes.append(indices)
+        after_nodes = np.unique(np.concatenate(after_nodes))
+        after_nodes = np.concatenate(
+            [previous_nodes, np.setdiff1d(after_nodes, previous_nodes)])
+        adj = U[:, after_nodes]
+        adjs += [adj]
+        sampled_nodes.append(previous_nodes)
+        previous_nodes = after_nodes
+    adjs.reverse()
+    sampled_nodes.reverse()
+    return adjs, previous_nodes, sampled_nodes
+
+
+def get_sampled_adjs_1(batch, laplacian_matrix, samp_num_list, depth = 1):
+    adjs, prev_nodes, sampled_nodes = mini_batch_exact(batch,
+                                                 adj_matrix = laplacian_matrix,
+                                                 depth = depth)
+    adjs = [sparse_to_tuple(v) for v in adjs]
+    return ((adjs, prev_nodes, sampled_nodes), batch)
+
+
+def calc_f1( y_true, y_pred,is_sigmoid):
+    if not is_sigmoid:
+        y_true = np.argmax(y_true, axis=1)
+        y_pred = np.argmax(y_pred, axis=1)
+        return metrics.f1_score(y_true, y_pred, average="micro")
+    else:
+        y_pred_met = deepcopy(y_pred)
+        y_pred_met[y_pred_met > 0] = 1
+        y_pred_met[y_pred_met <= 0] = 0
+        return metrics.f1_score(y_true, y_pred_met, average="micro"), metrics.f1_score(y_true, y_pred_met, average="macro")
 
 parser = argparse.ArgumentParser(description='Parameters for running IGLU')
 parser.add_argument('--batchsize', metavar='INT', default = 10000, dest='batch_size', type=int,
@@ -26,12 +130,10 @@ parser.add_argument('--gpuid', metavar='0|1|2|3',default = 1,  type = int, dest=
 parser.add_argument('--data_path', metavar='STRING',  type = str, dest='data_path', help = 'Path to the dataset')
 
 args = parser.parse_args()
-
-from utils import set_gpu
-
+        
 set_gpu(str(args.gpuid))
 
-############################### Load Data ###############################
+#Load Data
 start_data_time = time.time()
 labels = np.load(args.data_path+"/labels.npy")
 train_ix = np.load(args.data_path+"/TrainSortedIndex.npy")
@@ -41,8 +143,6 @@ feat_data = np.load(args.data_path+"/feat_preprocessed.npy")
 train_adj = sp.load_npz(args.data_path+"/train_adj.npz")
 full_adj = sp.load_npz(args.data_path+"/full_adj.npz")
 print("Time to load data:", time.time()-start_data_time)
-
-# Get Train Indices
 indices = {}
 indices['train'] = train_ix
 indices['valid'] = valid_ix
@@ -63,12 +163,11 @@ elif adj_normalize =="SAINT":
     train_laplacian = saint_normalize(train_adj + t)
     full_laplacian = saint_normalize(full_adj + sp.eye(full_adj.shape[0]))
 
-
 vals = get_tensor_values(train_laplacian, num_adj = 8)
 
 
-mask = [False for i in range((train_laplacian.shape[0]))]
 
+mask = [False for i in range((train_laplacian.shape[0]))]
 train_mask = deepcopy(mask)
 valid_mask = deepcopy(mask)
 test_mask = deepcopy(mask)
@@ -93,6 +192,9 @@ for elem in valid_ix:
     valid_mask[elem] = True
 for elem in test_ix:
     test_mask[elem] = True
+
+label_ph = tf.placeholder(tf.float32, shape=[None, None])
+mask_ph = tf.placeholder(tf.float32, shape=[None, None])
 
 tf.reset_default_graph()
 
@@ -152,35 +254,6 @@ optimizer = {
 }
 
 
-def mini_batch_exact(batch_nodes, adj_matrix, depth = 1):
-    sampled_nodes = []
-    previous_nodes = batch_nodes
-    adjs = []
-    for d in range(depth):
-        U = adj_matrix[previous_nodes, :]
-        after_nodes = []
-        for U_row in U:
-            indices = U_row.indices
-            after_nodes.append(indices)
-        after_nodes = np.unique(np.concatenate(after_nodes))
-        after_nodes = np.concatenate(
-            [previous_nodes, np.setdiff1d(after_nodes, previous_nodes)])
-        adj = U[:, after_nodes]
-        adjs += [adj]
-        sampled_nodes.append(previous_nodes)
-        previous_nodes = after_nodes
-    adjs.reverse()
-    sampled_nodes.reverse()
-    return adjs, previous_nodes, sampled_nodes
-
-
-def get_sampled_adjs_1(batch, laplacian_matrix, samp_num_list, depth = 1):
-    adjs, prev_nodes, sampled_nodes = mini_batch_exact(batch,
-                                                 adj_matrix = laplacian_matrix,
-                                                 depth = depth)
-    adjs = [sparse_to_tuple(v) for v in adjs]
-    return ((adjs, prev_nodes, sampled_nodes), batch)
-
 train_batches = []
 train_index = np.random.permutation(np.arange(len(train_ix)))
 
@@ -198,18 +271,6 @@ train_data_batch = {
     ix: ((results[ix][0][0], results[ix][0][1], results[ix][0][2]), results[ix][1])
 for ix, batch in enumerate(train_batches)
 }
-
-from sklearn import metrics
-def calc_f1( y_true, y_pred,is_sigmoid):
-    if not is_sigmoid:
-        y_true = np.argmax(y_true, axis=1)
-        y_pred = np.argmax(y_pred, axis=1)
-        return metrics.f1_score(y_true, y_pred, average="micro")
-    else:
-        y_pred_met = deepcopy(y_pred)
-        y_pred_met[y_pred_met > 0] = 1
-        y_pred_met[y_pred_met <= 0] = 0
-        return metrics.f1_score(y_true, y_pred_met, average="micro"), metrics.f1_score(y_true, y_pred_met, average="macro")
     
     
 train_feat = np.zeros((232965, 602))
